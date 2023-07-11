@@ -11,9 +11,10 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.env_util import SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3 import HerReplayBuffer, SAC
+from stable_baselines3.common.callbacks import CallbackList, EvalCallback
 
 from .envs.env_talos_deburring_her import EnvTalosDeburringHer
-from .utils.tb_callback import AllCallbacks, TensorboardCallback
+from .utils.tb_callback import AllCallbacks, SaveCallback, TensorboardCallback
 
 ################
 # Main HER SAC #
@@ -93,7 +94,19 @@ torch.set_num_threads(1)
 # Create environment
 env_class = EnvTalosDeburringHer
 model_class = SAC  # works also with SAC, DDPG and TD3
-callback_class = AllCallbacks
+callback_class = AllCallbacks(config_filename=config_filename, 
+                            training_name=training_name,
+                            stats_window_size=100, 
+                            check_freq=1000, 
+                            verbose=verbose)
+save_callback = SaveCallback(config_filename=config_filename, 
+                            training_name=training_name,
+                            check_freq=1000,
+                            verbose=verbose
+                            )
+tensorboard_callback = TensorboardCallback(stats_window_size=100,
+                                           verbose=verbose)
+callback_list = CallbackList([save_callback, tensorboard_callback])
 
 if number_environments == 1:
     env_training = env_class(params_designer, params_env, GUI=False)
@@ -102,7 +115,6 @@ else:
         number_environments
         * [lambda: Monitor(env_class(params_designer, params_env, GUI=False))],
     )
-
 
 goal_selection_strategy = "future" # equivalent to GoalSelectionStrategy.FUTURE
 model = model_class(
@@ -123,23 +135,16 @@ model = model_class(
     policy_kwargs=dict(net_arch=[512, 512, 512])
 )
 
-def saver(temp_file_yaml, temp_best_save, training_name, model):
+def saver(training_name, model):
     print("Saving model as {}".format(model.logger.dir + "/" + training_name))
     model.save(model.logger.dir + "/" + training_name)
-    shutil.copy(temp_file_yaml, model.logger.dir + "/" + training_name + ".yaml")
-    shutil.copy(temp_best_save, model.logger.dir + "/" + "best_model.zip")
-    os.remove(temp_file_yaml)
-    os.remove(temp_best_save)
 
 def handler(signum, frame):
-    saver(temp_file_yaml=temp_file_yaml, 
-          temp_best_save=temp_best_save, 
-          training_name=training_name, 
+    saver(training_name=training_name, 
           model=model)
     exit(1)
 
 signal.signal(signal.SIGINT, handler)
-shutil.copy(config_filename, temp_file_yaml)
 
 # 
 # Train Agent
@@ -149,15 +154,9 @@ model.learn(
     total_timesteps=total_timesteps,
     tb_log_name=training_name,
     log_interval=log_interval,
-    callback=callback_class(log_dir=log_dir, 
-                            stats_window_size=100, 
-                            check_freq=1000, 
-                            verbose=verbose),
+    callback=callback_class,
 )
 
-print(model.logger.dir)
-saver(temp_file_yaml=temp_file_yaml, 
-      temp_best_save=temp_best_save, 
-      training_name=training_name, 
+saver(training_name=training_name, 
       model=model)
 env_training.close()
