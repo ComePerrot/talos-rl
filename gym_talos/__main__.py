@@ -69,8 +69,6 @@ else:
     training_name = current_date + "_" + params_training["name"]
 
 log_dir = "./logs/"
-temp_file_yaml = "./logs/temp.yaml"
-temp_best_save = "./logs/best_model.zip"
 
 number_environments = params_training["environment_quantity"]
 total_timesteps = params_training["total_timesteps"]
@@ -155,6 +153,7 @@ model.learn(
     log_interval=log_interval,
     callback=callback_class,
 )
+
 saver(training_name=training_name, 
       model=model)
 env_training.close()
