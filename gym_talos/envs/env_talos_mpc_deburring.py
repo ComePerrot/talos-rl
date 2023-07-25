@@ -1,12 +1,12 @@
 import gymnasium as gym
 import numpy as np
 import pinocchio as pin
-from deburring_mpc import RobotDesigner
+from deburring_mpc import RobotDesigner, OCP
 
 from gym_talos.simulator.bullet_Talos import TalosDeburringSimulator
 
 
-class EnvTalosBase(gym.Env):
+class EnvTalosMPC(gym.Env):
     def __init__(self, params_env, params_designer, param_ocp, GUI=False) -> None:
         self._init_parameters(params_env)
 
@@ -15,9 +15,9 @@ class EnvTalosBase(gym.Env):
         self.pinWrapper.initialize(params_designer)
 
         gripper_SE3_tool = pin.SE3.Identity()
-        gripper_SE3_tool.translation[0] = params_designer["toolFramePos"][0]
-        gripper_SE3_tool.translation[1] = params_designer["toolFramePos"][1]
-        gripper_SE3_tool.translation[2] = params_designer["toolFramePos"][2]
+        gripper_SE3_tool.translation[0] = params_designer["toolPosition"][0]
+        gripper_SE3_tool.translation[1] = params_designer["toolPosition"][1]
+        gripper_SE3_tool.translation[2] = params_designer["toolPosition"][2]
         self.pinWrapper.add_end_effector_frame(
             "deburring_tool",
             "gripper_left_fingertip_3_link",
@@ -26,9 +26,11 @@ class EnvTalosBase(gym.Env):
 
         self.rmodel = self.pinWrapper.get_rmodel()
 
-        # OCP
+        self.arm_joint_ID = self.rmodel.names.tolist().index('arm_left_1_joint')-2+7
 
+        # OCP
         self._init_ocp(param_ocp)
+        self.horizon_length = param_ocp["horizon_length"]
 
         # Simulator
         self.simulator = TalosDeburringSimulator(
@@ -39,20 +41,20 @@ class EnvTalosBase(gym.Env):
             dt=self.timeStepSimulation,
         )
 
-        action_dimension = self.rmodel.nq
+        action_dimension = 4
         observation_dimension = len(self.simulator.getRobotState())
         self._init_env_variables(action_dimension, observation_dimension)
 
     def _init_ocp(self, param_ocp):
-        oMtarget = pin.SE3.Identity()
-        oMtarget.translation[0] = self.targetPos[0]
-        oMtarget.translation[1] = self.targetPos[1]
-        oMtarget.translation[2] = self.targetPos[2]
+        self.oMtarget = pin.SE3.Identity()
+        self.oMtarget.translation[0] = self.targetPos[0]
+        self.oMtarget.translation[1] = self.targetPos[1]
+        self.oMtarget.translation[2] = self.targetPos[2]
 
-        oMtarget.rotation = np.array([[0, 0, -1], [0, -1, 0], [-1, 0, 0]])
+        self.oMtarget.rotation = np.array([[0, 0, -1], [0, -1, 0], [-1, 0, 0]])
 
-        self.crocoWrapper = self.OCP(param_ocp, self.pinWrapper)
-        self.crocoWrapper.initialize(self.pinWrapper.get_x0(), oMtarget)
+        self.crocoWrapper = OCP(param_ocp, self.pinWrapper)
+        self.crocoWrapper.initialize(self.pinWrapper.get_x0(), self.oMtarget)
 
         self.ddp = self.crocoWrapper.solver
 
@@ -64,7 +66,8 @@ class EnvTalosBase(gym.Env):
         Args:
             params_env: kwargs for the environment
         """
-        # Simumlation timings
+        # Simulation timings
+        print(params_env)
         self.timeStepSimulation = float(params_env["timeStepSimulation"])
         self.numSimulationSteps = params_env["numSimulationSteps"]
 
@@ -98,7 +101,9 @@ class EnvTalosBase(gym.Env):
         if self.normalizeObs:
             self._init_obsNormalizer()
 
-        self.torqueScale = np.array(self.rmodel.effortLimit)
+        self._init_actScaler()
+
+        self.q0 = self.pinWrapper.get_x0().copy()
 
         action_dim = action_dimension
         self.action_space = gym.spaces.Box(
@@ -148,10 +153,13 @@ class EnvTalosBase(gym.Env):
             Observation of the initial state.
         """
         self.timer = 0
-        self.simulator.reset()
+        self.simulator.reset([0, 0, 0])
 
         x_measured = self.simulator.getRobotState()
         self.pinWrapper.update_reduced_model(x_measured)
+
+        # TODO: reset OCP
+        self.crocoWrapper.initialize(self.pinWrapper.get_x0(), self.oMtarget)
 
         return self._getObservation(x_measured), {}
 
@@ -165,7 +173,7 @@ class EnvTalosBase(gym.Env):
         The termination and condition are checked and the reward is computed.
 
         Args:
-            action: Normalized action vector
+            action: Normalized action vector (arm arm posture reference)
 
         Returns:
             Formatted observations
@@ -173,14 +181,33 @@ class EnvTalosBase(gym.Env):
             Boolean indicating this rollout is done
         """
         self.timer += 1
-        torques = self._scaleAction(action)
+        arm_reference = self._actScaler(action)
+
+        posture_reference = self.q0
+        posture_reference[self.arm_joint_ID : self.arm_joint_ID + 4] = arm_reference
+
+        x0 = self.simulator.getRobotState()
 
         for _ in range(self.numSimulationSteps):
+            x_measured = self.simulator.getRobotState()
+            torques = (
+                self.crocoWrapper.torque
+                + self.crocoWrapper.gain @ self.crocoWrapper.state.diff(x_measured, x0)
+            )
             self.simulator.step(torques)
 
         x_measured = self.simulator.getRobotState()
 
         self.pinWrapper.update_reduced_model(x_measured)
+
+        self.crocoWrapper.recede()
+        self.crocoWrapper.change_goal_cost_activation(self.horizon_length - 1, True)
+        self.crocoWrapper.change_posture_reference(
+            self.horizon_length - 1,
+            posture_reference,
+        )
+
+        self.crocoWrapper.solve(x_measured)
 
         observation = self._getObservation(x_measured)
         terminated = self._checkTermination(x_measured)
@@ -200,6 +227,8 @@ class EnvTalosBase(gym.Env):
         Returns:
             Fromated observations
         """
+        # x_meas_reduced = x_measured[7:self.rmodel.nq,self.rmodel.nq+6:]
+        # x_meas_reduced = x_measured[self.rmodel.nq+6:]
         if self.normalizeObs:
             observation = self._obsNormalizer(x_measured)
         else:
@@ -233,7 +262,7 @@ class EnvTalosBase(gym.Env):
         reward_command = -np.linalg.norm(torques)
         # target distance
         reward_toolPosition = -np.linalg.norm(
-            self.pinWrapper.get_end_effector_pos() - self.targetPos,
+            self.pinWrapper.get_end_effector_frame().translation - self.targetPos,
         )
 
         return (
@@ -276,7 +305,7 @@ class EnvTalosBase(gym.Env):
         """
         # Balance
         truncation_balance = (not (self.minHeight == 0)) and (
-            self.pinWrapper.CoM[2] < self.minHeight
+            self.pinWrapper.get_com_position()[2] < self.minHeight
         )
 
         # Limits
@@ -302,6 +331,29 @@ class EnvTalosBase(gym.Env):
         """
         return self.torqueScale * action
 
+    def _init_actScaler(self):
+        """Initializes the action scaler using robot model limits"""
+        self.lowerActLim = self.rmodel.lowerPositionLimit[
+            self.arm_joint_ID : self.arm_joint_ID + 4
+        ]
+        self.upperActLim = self.rmodel.upperPositionLimit[
+            self.arm_joint_ID : self.arm_joint_ID + 4
+        ]
+
+        self.avgAct = (self.upperActLim + self.lowerActLim) / 2
+        self.diffAct = self.upperActLim - self.lowerActLim
+
+    def _actScaler(self, action):
+        """Scale the action given by the agent
+
+        Args:
+            action: normalized action given by the agent
+
+        Returns:
+            unnormalized reference
+        """
+        return action*self.diffAct + self.avgAct
+
     def _init_obsNormalizer(self):
         """Initializes the observation normalizer using robot model limits"""
         self.lowerObsLim = np.concatenate(
@@ -310,6 +362,10 @@ class EnvTalosBase(gym.Env):
                 -self.rmodel.velocityLimit,
             ),
         )
+        self.lowerObsLim[:7] = -5
+        self.lowerObsLim[
+            self.pinWrapper.get_rmodel().nq : self.pinWrapper.get_rmodel().nq + 6
+        ] = -5
 
         self.upperObsLim = np.concatenate(
             (
@@ -317,6 +373,10 @@ class EnvTalosBase(gym.Env):
                 self.rmodel.velocityLimit,
             ),
         )
+        self.upperObsLim[:7] = 5
+        self.upperObsLim[
+            self.pinWrapper.get_rmodel().nq : self.pinWrapper.get_rmodel().nq + 6
+        ] = 5
 
         self.avgObs = (self.upperObsLim + self.lowerObsLim) / 2
         self.diffObs = self.upperObsLim - self.lowerObsLim
