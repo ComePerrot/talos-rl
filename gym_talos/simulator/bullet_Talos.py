@@ -1,6 +1,7 @@
 import numpy as np
 import pybullet as p  # PyBullet simulator
 import pybullet_data
+import pinocchio as pin
 
 
 class TalosDeburringSimulator:
@@ -17,6 +18,7 @@ class TalosDeburringSimulator:
         self._setupBullet(enableGUI, enableGravity, dt)
         self._setupRobot(URDF, rmodelComplete, controlledJointsIDs, randomInit)
         self._setupInitializer(randomInit, rmodelComplete)
+        self._createObjectVisuals()
 
     def _setupBullet(self, enableGUI, enableGravity, dt):
         # Start the client for PyBullet
@@ -174,66 +176,92 @@ class TalosDeburringSimulator:
                 ]
             ] = i
 
-    def createTargetVisual(self, target):
-        """Create visual representation of the target to track
+    def _createObjectVisuals(self, target=True, tool=True, base=True):
+        """Creates visual element for the simulation
 
-        The visual will not appear unless the physics client is set to
-        SHARED_MEMORY
-        :param target Position of the target in the world
+        Args:
+            target: Boolean to activate display of the target. Defaults to True.
+            tool: Boolean to activate display of the tool. Defaults to True.
+            base: Boolean to activate display of the base. Defaults to True.
         """
-        try:
-            p.removeBody(self.target_MPC)
-        except:  # noqa: E722
-            pass
-        RADIUS = 0.02
-        LENGTH = 0.0001
-        blueBox = p.createVisualShape(
+        RADIUS = 0.01
+        LENGTH = 0.01
+        blueSphere = p.createVisualShape(
+            shapeType=p.GEOM_SPHERE,
+            rgbaColor=[0, 0, 1, 0.5],
+            visualFramePosition=[0.0, 0.0, 0.0],
+            radius=RADIUS,
+            halfExtents=[0.0, 0.0, 0.0],
+        )
+        blueCapsule = p.createVisualShape(
             shapeType=p.GEOM_CAPSULE,
             rgbaColor=[0, 0, 1, 1.0],
             visualFramePosition=[0.0, 0.0, 0.0],
-            radius=RADIUS,
+            radius=RADIUS / 3,
             length=LENGTH,
             halfExtents=[0.0, 0.0, 0.0],
         )
-
-        self.target_MPC = p.createMultiBody(
-            baseMass=0.0,
-            baseInertialFramePosition=[0, 0, 0],
-            baseVisualShapeIndex=blueBox,
-            basePosition=[target[0], target[1], target[2]],
-            useMaximalCoordinates=True,
-        )
-
-    def createBaseRobotVisual(self, baseRobot):
-        """Create visual representation of the CoM
-
-        The visual will not appear unless the physics client is set to
-        SHARED_MEMORY
-        :param CoM Position of the CoM in the world
-        :param baseRobot Position of the base of the robot in the world
-        """
-        try:
-            p.removeBody(self.baseRobot_MPC)
-        except:  # noqa: E722
-            pass
-        RADIUS = 0.2
-        LENGTH = 0.0001
-        redBox = p.createVisualShape(
-            shapeType=p.GEOM_CAPSULE,
+        redSphere = p.createVisualShape(
+            shapeType=p.GEOM_SPHERE,
             rgbaColor=[1, 0, 0, 1.0],
             visualFramePosition=[0.0, 0.0, 0.0],
-            radius=RADIUS,
-            length=LENGTH,
+            radius=RADIUS * 10,
             halfExtents=[0.0, 0.0, 0.0],
         )
 
-        self.baseRobot_MPC = p.createMultiBody(
-            baseMass=0.0,
-            baseInertialFramePosition=[0, 0, 0],
-            baseVisualShapeIndex=redBox,
-            basePosition=[baseRobot[0], baseRobot[1], baseRobot[2]],
-            useMaximalCoordinates=True,
-        )
+        if target:
+            self.target_visual = p.createMultiBody(
+                baseMass=0.0,
+                baseInertialFramePosition=[0, 0, 0],
+                baseVisualShapeIndex=blueSphere,
+                basePosition=[0.0, 0.0, 0.0],
+                useMaximalCoordinates=True,
+            )
+
+        if tool:
+            self.tool_visual = p.createMultiBody(
+                baseMass=0.0,
+                baseInertialFramePosition=[0, 0, 0],
+                baseVisualShapeIndex=blueCapsule,
+                basePosition=[0.0, 0.0, 0.0],
+                useMaximalCoordinates=True,
+            )
+
+        if base:
+            self.base_visual = p.createMultiBody(
+                baseMass=0.0,
+                baseInertialFramePosition=[0, 0, 0],
+                baseVisualShapeIndex=redSphere,
+                basePosition=[0.0, 0.0, 0.0],
+                useMaximalCoordinates=True,
+            )
+
+    def _setVisualObjectPosition(
+        self,
+        object_name,
+        object_position,
+        object_orientation=None,
+    ):
+        """Move an object to the given position
+
+        Arguments:
+            object_name -- Name of the object to move
+            object_position -- Position of the object in the world
+            object_orientation -- Quaternion representating the orientation of
+                the object wrt the world
+        """
+        if object_orientation is not None:
+            p.resetBasePositionAndOrientation(
+                object_name,
+                object_position,
+                object_orientation,
+            )
+        else:
+            p.resetBasePositionAndOrientation(
+                object_name,
+                object_position,
+                np.array([0, 0, 0, 1]),
+            )
 
     def getRobotState(self):
         """Get current state of the robot from pyBullet"""
@@ -279,8 +307,9 @@ class TalosDeburringSimulator:
         """Get contact points between the robot and the environment"""
         return [(i[4], i[6], i[9]) for i in p.getContactPoints()]
 
-    def step(self, torques):
+    def step(self, torques, oMtool=None, base_pose=None):
         """Do one step of simulation"""
+        self._updateVisuals(oMtool, base_pose)
         self._applyTorques(torques)
         p.stepSimulation()
         self.baseRobot = np.array(
@@ -291,6 +320,25 @@ class TalosDeburringSimulator:
             ],
         )
 
+    def _updateVisuals(self, oMtool, base_pose):
+        """Update visual elements of the simulation
+
+        Args:
+            oMtool: Placement of the tool expressed as a SE3 object
+            base_pose: position of the base of the robot
+        """
+        if oMtool is not None:
+            self._setVisualObjectPosition(
+                self.tool_visual,
+                oMtool.translation,
+                pin.Quaternion(oMtool.rotation).coeffs(),
+            )
+        if base_pose is not None:
+            self._setVisualObjectPosition(
+                self.base_visual,
+                base_pose,
+            )
+
     def _applyTorques(self, torques):
         """Apply computed torques to the robot"""
         p.setJointMotorControlArray(
@@ -300,7 +348,7 @@ class TalosDeburringSimulator:
             forces=torques,
         )
 
-    def reset(self, target_position, seed=None):
+    def reset(self, target_pos, seed=None):
         """Reset robot to initial configuration"""
         # Reset base
         p.resetBasePositionAndOrientation(
@@ -324,7 +372,7 @@ class TalosDeburringSimulator:
         )
 
         self._reset_robot_joints()
-        self.createTargetVisual(target_position)
+        self._setVisualObjectPosition(self.target_visual, target_pos)
 
     def _reset_robot_joints(self):
         for i in range(len(self.initial_joint_positions)):
